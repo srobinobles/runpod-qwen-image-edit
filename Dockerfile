@@ -1,41 +1,39 @@
 # syntax=docker/dockerfile:1
 #
-# Qwen-Image-Edit-2511 を RunPod Serverless で動かすためのワーカー。
+# RunPod Serverless worker for Qwen-Image-Edit-2511.
 #
-# 公式の worker-comfyui にモデルを焼き込むだけの薄い派生で、handler も
-# entrypoint も持たない。公式側の実装がそのまま動く。
+# A thin derivative of the official worker-comfyui that just bakes the models
+# into the image — no custom handler, no entrypoint. The official implementation
+# runs as-is.
 #
-# ワークフローは API の input.workflow で毎回渡す設計にしてある。出力サイズ・
-# ステップ数・LoRA の差し替えを、イメージの再ビルドなしで変えられる。
-# 既成ワーカーの多くはワークフローをイメージ内に固定しており、出力が正方形から
-# 変えられない (指定した width/height が黙って捨てられる) 問題があった。
+# The workflow is passed per request via the API's input.workflow, so output
+# size, step count, and LoRA choice can change without rebuilding the image.
+# Many prebuilt workers freeze the workflow inside the image and can't move the
+# output off square (a given width/height is silently dropped).
 #
-# モデルはネットワークボリュームではなくイメージに焼き込む。ボリューム経由は
-# 存在するだけで容量課金が続くうえ、コールドスタートも読み出しの分だけ遅い。
-# CUDA 12.8 向けにビルドされた PyTorch が入っている base を明示的に選ぶ。
-# 素の 5.8.6-base は comfy-cli の既定でインストールされるため、より新しい
-# CUDA 向けの PyTorch が入り、hub.json で 12.8 を指定したホストでは
-# "no kernel image is available" で起動に失敗する。
+# Models are baked into the image, not mounted from a network volume: a volume
+# keeps billing for capacity as long as it exists, and reading weights from it
+# makes cold starts slower. The base tag is pinned to a PyTorch built for CUDA
+# 12.8 — the plain 5.8.6-base installs comfy-cli's default (newer) PyTorch, which
+# fails to start ("no kernel image is available") on a host that declares 12.8.
 FROM runpod/worker-comfyui:5.8.6-base-cuda12.8.1 AS base
 
-# モデルはステージを分けて取得する。BuildKit は依存関係のないステージを
-# 並列に実行するため、逐次で 22 分かかっていたダウンロードが、最も大きい
-# 1 本ぶんの時間に近づく。RunPod Hub のビルドは 30 分で打ち切られ、
-# イメージの書き出しと転送だけで 8 分を使うので、ここを詰めないと
-# 完走しない (逐次版は書き出しの途中で時間切れになった)。
-#
-# 取得先は base に必ず入っている wget で固定する。comfy model download は
-# 配置先が comfy-cli の既定ワークスペース設定に依存するため、
-# 絶対パスへ直接落として最終ステージで所定の位置に COPY する。
+# Models are fetched in separate stages. BuildKit runs independent stages in
+# parallel, so a download that took ~22 min sequentially drops to about the time
+# of the single largest file. RunPod Hub caps the build at 30 min and spends ~8
+# of those on image export/transfer, so the parallelism is what lets it finish.
+# Fetch with the wget that ships in base; download to absolute paths and COPY
+# into place in the final stage (comfy model download's destination depends on
+# comfy-cli's default workspace setting).
 
-# 拡散モデル本体。FP8 mixed の量子化版を使う (bf16 のフル版は 53.7GB あり
-# 80GB クラスの GPU が要る。FP8 なら 24GB クラスに載る)。
+# The diffusion model. FP8-mixed quantized build (the bf16 full weights are
+# 53.7 GB and need an 80 GB-class GPU; FP8 fits on a 24 GB card).
 FROM base AS diffusion
 RUN mkdir -p /models/diffusion_models \
  && wget -q --tries=3 -O /models/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors \
       https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2511_fp8mixed.safetensors
 
-# テキストエンコーダ (Qwen2.5-VL 7B)
+# Text encoder (Qwen2.5-VL 7B).
 FROM base AS text-encoder
 RUN mkdir -p /models/text_encoders \
  && wget -q --tries=3 -O /models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors \
@@ -46,23 +44,28 @@ RUN mkdir -p /models/vae \
  && wget -q --tries=3 -O /models/vae/qwen_image_vae.safetensors \
       https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors
 
-# 4 ステップで生成するための Lightning LoRA。ステップ数を落とすぶん
-# 生成時間と GPU 課金が縮む。使うかどうかはワークフロー側で決められる。
+# LoRAs. The Lightning LoRA gives 4-step generation (less time + GPU cost; the
+# workflow decides whether to use it).
+# ── ADDED (Ancientel §2.B Phase B): also pull fal's multi-angle LoRA into the
+#    same stage. The existing COPY --from=lora carries all of /models/loras/ into
+#    the image, so one extra wget here is all that's needed.
 FROM base AS lora
 RUN mkdir -p /models/loras \
  && wget -q --tries=3 -O /models/loras/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
-      https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
+      https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning/resolve/main/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
+ && wget -q --tries=3 -O /models/loras/qwen-image-edit-2511-multiple-angles-lora.safetensors \
+      https://huggingface.co/fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA/resolve/main/qwen-image-edit-2511-multiple-angles-lora.safetensors
 
 FROM base
 
-# モデルごとに COPY を分けてレイヤーを 4 つに保つ。1 つにまとめると
-# 29GB 弱の単一レイヤーになり、書き出しと転送がさらに遅くなる。
+# Keep models in separate COPY layers (four layers). Merging them into one makes
+# a single ~29 GB layer, which makes export/transfer even slower.
 COPY --from=diffusion /models/diffusion_models/ /comfyui/models/diffusion_models/
 COPY --from=text-encoder /models/text_encoders/ /comfyui/models/text_encoders/
 COPY --from=vae /models/vae/ /comfyui/models/vae/
 COPY --from=lora /models/loras/ /comfyui/models/loras/
 
-# handler はベースイメージにも同じものが入っているが、Hub の掲載要件が
-# リポジトリ内の handler.py を求めるため、明示的に置いて上書きする。
-# 中身は worker-comfyui のものをそのまま使う (どちらも AGPL-3.0)。
+# The base image already ships this handler, but the Hub listing requires a
+# handler.py in the repo itself, so it's placed here explicitly. Contents are
+# worker-comfyui's, unchanged (both are AGPL-3.0).
 COPY handler.py /handler.py
